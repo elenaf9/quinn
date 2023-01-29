@@ -724,3 +724,61 @@ async fn two_datagram_readers() {
     assert!(*a == *b"one" || *b == *b"one");
     assert!(*a == *b"two" || *b == *b"two");
 }
+
+#[test]
+fn racy_stream_closing() {
+    let _guard = subscribe();
+    let runtime = rt_basic();
+    let endpoint = {
+        let _guard = runtime.enter();
+        endpoint()
+    };
+    let endpoint2 = endpoint.clone();
+
+    const MSG: &[u8] = b"some message";
+
+    runtime.spawn(async move {
+        let new_conn = endpoint
+            .connect(endpoint.local_addr().unwrap(), "localhost")
+            .unwrap()
+            .await
+            .expect("connect");
+        let mut stream = new_conn.accept_uni().await.expect("incoming streams");
+
+        let mut msg = vec![0; MSG.len()];
+        stream.read(&mut msg).await.unwrap();
+        assert_eq!(msg, MSG);
+
+        drop(stream);
+
+        // Delay so that the connection doesn't close
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    });
+
+    let finish_result = runtime.block_on(async move {
+        let new_conn = endpoint2
+            .accept()
+            .await
+            .expect("endpoint")
+            .await
+            .expect("connection");
+        let mut s = new_conn.open_uni().await.unwrap();
+
+        s.write_all(MSG).await.unwrap();
+        // Tiny delay which results in the FIN bit below to be send in a separate
+        // frame.
+        tokio::time::sleep(Duration::from_millis(1)).await;
+
+        // This returns `WriteError::Stopped` because the peer already dropped
+        // their RecvStream.
+        // We don't know if the peer dropped it before/ while reading our write data
+        // (which we should treat as error) or after successfully reading everything
+        // (which should not cause an error).
+        s.finish().await
+    });
+
+    match finish_result {
+        Ok(()) => {}
+        Err(e) => panic!("Finishing the stream failed: {e}"),
+    }
+}
